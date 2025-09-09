@@ -18,4 +18,4 @@ COPY .env .
 EXPOSE 8000
 
 # Run the application
-CMD ["python", "scheduler_api.py"]
+CMD ["python", "scheduler_api2.py"]
