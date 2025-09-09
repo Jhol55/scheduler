@@ -257,18 +257,18 @@ def signal_handler(signum, frame):
     scheduler.shutdown(wait=True)
     sys.exit(0)
 
-# signal.signal(signal.SIGINT, signal_handler)
-# signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # -------------------
 # Run server
 # -------------------
-if __name__ == "__main__":
-    print(f"[{datetime.now().isoformat()}] Starting Scheduler API server v2.0.1")
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        log_level="info",
-        access_log=True
-    )
+
+print(f"[{datetime.now().isoformat()}] Starting Scheduler API server v2.0.1")
+uvicorn.run(
+    app,
+    host="0.0.0.0",
+    port=8000,
+    log_level="info",
+    access_log=True
+)
