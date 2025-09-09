@@ -2,9 +2,9 @@ import json
 import os
 import sys
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
-from datetime import timezone
+
 import redis
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -62,7 +62,7 @@ print(f"[{datetime.now().isoformat()}] Scheduler started")
 # -------------------
 # FastAPI app
 # -------------------
-app = FastAPI(title="Scheduler API", version="1.0.0")
+app = FastAPI(title="Scheduler API", version="2.0.0")
 
 # -------------------
 # Models & Auth
@@ -105,7 +105,8 @@ def fire_webhook(message_id: str, retry_count: int = 0):
         response = requests.post(webhook_url, json=payload, timeout=30)
         response.raise_for_status()
         print(f"{log_prefix} Webhook fired successfully ({response.status_code})")
-        # Remove from Redis after success
+
+        # Remove from Redis and scheduler after success
         redis_client.delete(redis_key)
         try:
             scheduler.remove_job(message_id)
@@ -135,8 +136,8 @@ def schedule_message(message_data: Dict[str, Any]):
     message_id = message_data["id"]
     schedule_time = datetime.fromisoformat(message_data["scheduleTo"].replace("Z", "+00:00"))
     now = datetime.now(timezone.utc)
+
     if schedule_time <= now:
-        # Fire immediately in a separate thread
         threading.Thread(target=fire_webhook, args=(message_id, 0), daemon=True).start()
         return
 
@@ -159,6 +160,7 @@ def restore_scheduled_messages():
         try:
             message_data = json.loads(redis_client.get(key))
             schedule_message(message_data)
+            print(f"[{datetime.now().isoformat()}] Restored message {message_data['id']}")
         except Exception as e:
             print(f"Failed to restore message {key}: {e}")
 
@@ -185,7 +187,11 @@ async def delete_scheduled_message(message_id: str, token: str = Depends(verify_
         raise HTTPException(status_code=404, detail="Message not found")
 
     redis_client.delete(redis_key)
-    scheduler.remove_job(message_id)
+    try:
+        scheduler.remove_job(message_id)
+    except JobLookupError:
+        pass
+
     return {"status": "deleted", "messageId": message_id}
 
 @app.get("/messages")
@@ -211,4 +217,4 @@ async def health_check():
 # -------------------
 if __name__ == "__main__":
     print(f"[{datetime.now().isoformat()}] Starting Scheduler API server")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("scheduler_api_new:app", host="0.0.0.0", port=8000)
