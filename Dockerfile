@@ -11,11 +11,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY scheduler_api2.py .
+COPY scheduler_api_new.py .
 COPY .env .
 
 # Expose port 8000
 EXPOSE 8000
 
 # Run the application
-CMD ["python", "scheduler_api2.py"]
+CMD ["python", "scheduler_api_new.py"]
