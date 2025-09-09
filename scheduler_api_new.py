@@ -4,7 +4,7 @@ import sys
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, Any
-
+from datetime import timezone
 import redis
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -131,7 +131,7 @@ def fire_webhook(message_id: str, retry_count: int = 0):
 def schedule_message(message_data: Dict[str, Any]):
     message_id = message_data["id"]
     schedule_time = datetime.fromisoformat(message_data["scheduleTo"].replace("Z", "+00:00"))
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if schedule_time <= now:
         # Fire immediately in a separate thread
         threading.Thread(target=fire_webhook, args=(message_id, 0), daemon=True).start()
