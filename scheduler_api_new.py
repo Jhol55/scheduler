@@ -107,7 +107,10 @@ def fire_webhook(message_id: str, retry_count: int = 0):
         print(f"{log_prefix} Webhook fired successfully ({response.status_code})")
         # Remove from Redis after success
         redis_client.delete(redis_key)
-        scheduler.remove_job(message_id)
+        try:
+            scheduler.remove_job(message_id)
+        except JobLookupError:
+            pass
 
     except requests.RequestException as e:
         print(f"{log_prefix} Failed to fire webhook: {e}")
