@@ -137,7 +137,17 @@ def schedule_message(message_data: Dict[str, Any]):
     schedule_time = datetime.fromisoformat(message_data["scheduleTo"].replace("Z", "+00:00"))
     now = datetime.now(timezone.utc)
 
+    # Check if job already exists
+    try:
+        existing_job = scheduler.get_job(message_id)
+        if existing_job:
+            print(f"[{datetime.now().isoformat()}] Job {message_id} already exists, skipping")
+            return
+    except JobLookupError:
+        pass  # Job doesn't exist, continue
+
     if schedule_time <= now:
+        print(f"[{datetime.now().isoformat()}] Message {message_id} is due now, executing immediately")
         threading.Thread(target=fire_webhook, args=(message_id, 0), daemon=True).start()
         return
 
@@ -152,19 +162,87 @@ def schedule_message(message_data: Dict[str, Any]):
     print(f"[{datetime.now().isoformat()}] Scheduled message {message_id} for {schedule_time.isoformat()}")
 
 # -------------------
+# Instance management for EasyPanel deployments
+# -------------------
+INSTANCE_ID = f"scheduler-{os.getpid()}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+INSTANCE_LOCK_KEY = "scheduler:instance:lock"
+INSTANCE_LOCK_TTL = 30  # seconds
+
+def acquire_instance_lock():
+    """Acquire instance lock to prevent multiple instances from running simultaneously"""
+    try:
+        # Try to set lock with TTL
+        result = redis_client.set(INSTANCE_LOCK_KEY, INSTANCE_ID, nx=True, ex=INSTANCE_LOCK_TTL)
+        if result:
+            print(f"[{datetime.now().isoformat()}] Instance lock acquired: {INSTANCE_ID}")
+            return True
+        else:
+            print(f"[{datetime.now().isoformat()}] Another instance is already running, skipping restoration")
+            return False
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Failed to acquire instance lock: {e}")
+        return False
+
+def refresh_instance_lock():
+    """Refresh instance lock to keep it alive"""
+    try:
+        redis_client.set(INSTANCE_LOCK_KEY, INSTANCE_ID, ex=INSTANCE_LOCK_TTL)
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Failed to refresh instance lock: {e}")
+
+# -------------------
 # Restore messages from Redis on startup
 # -------------------
 def restore_scheduled_messages():
+    # Only restore if we have the instance lock
+    if not acquire_instance_lock():
+        return
+    
     keys = redis_client.keys("message:*")
+    restored_count = 0
+    skipped_count = 0
+    
+    print(f"[{datetime.now().isoformat()}] Starting restoration of {len(keys)} messages from Redis")
+    
     for key in keys:
         try:
             message_data = json.loads(redis_client.get(key))
+            message_id = message_data['id']
+            
+            # Check if job already exists in scheduler
+            try:
+                existing_job = scheduler.get_job(message_id)
+                if existing_job:
+                    print(f"[{datetime.now().isoformat()}] Job {message_id} already exists in scheduler, skipping")
+                    skipped_count += 1
+                    continue
+            except JobLookupError:
+                pass  # Job doesn't exist, continue
+            
             schedule_message(message_data)
-            print(f"[{datetime.now().isoformat()}] Restored message {message_data['id']}")
+            restored_count += 1
+            print(f"[{datetime.now().isoformat()}] Restored message {message_id}")
+            
         except Exception as e:
-            print(f"Failed to restore message {key}: {e}")
+            print(f"[{datetime.now().isoformat()}] Failed to restore message {key}: {e}")
+    
+    print(f"[{datetime.now().isoformat()}] Restoration complete: {restored_count} restored, {skipped_count} skipped")
 
+# Start restoration
 restore_scheduled_messages()
+
+# Start background task to refresh instance lock
+def refresh_lock_task():
+    while True:
+        try:
+            refresh_instance_lock()
+            threading.Event().wait(10)  # Refresh every 10 seconds
+        except Exception as e:
+            print(f"[{datetime.now().isoformat()}] Error in lock refresh task: {e}")
+            break
+
+lock_refresh_thread = threading.Thread(target=refresh_lock_task, daemon=True)
+lock_refresh_thread.start()
 
 # -------------------
 # API Endpoints
@@ -172,8 +250,18 @@ restore_scheduled_messages()
 @app.post("/messages")
 async def create_scheduled_message(message: ScheduleMessage, token: str = Depends(verify_token)):
     redis_key = f"message:{message.id}"
+    
+    # Check if message exists in Redis
     if redis_client.exists(redis_key):
         raise HTTPException(status_code=409, detail="Message already exists")
+    
+    # Check if job exists in scheduler
+    try:
+        existing_job = scheduler.get_job(message.id)
+        if existing_job:
+            raise HTTPException(status_code=409, detail="Message job already exists in scheduler")
+    except JobLookupError:
+        pass  # Job doesn't exist, continue
 
     message_data = message.model_dump()  # Pydantic V2
     redis_client.set(redis_key, json.dumps(message_data))
@@ -208,9 +296,45 @@ async def list_scheduled_messages(token: str = Depends(verify_token)):
 async def health_check():
     try:
         redis_client.ping()
-        return {"status": "healthy", "redis": "connected"}
+        
+        # Check if this instance has the lock
+        current_lock = redis_client.get(INSTANCE_LOCK_KEY)
+        is_active_instance = current_lock == INSTANCE_ID
+        
+        return {
+            "status": "healthy", 
+            "redis": "connected",
+            "instanceId": INSTANCE_ID,
+            "isActiveInstance": is_active_instance,
+            "scheduledJobs": len(scheduler.get_jobs())
+        }
     except Exception as e:
         return {"status": "unhealthy", "redis": "disconnected", "error": str(e)}
+
+@app.get("/instance/status")
+async def instance_status(token: str = Depends(verify_token)):
+    """Get detailed instance status for debugging"""
+    try:
+        current_lock = redis_client.get(INSTANCE_LOCK_KEY)
+        is_active_instance = current_lock == INSTANCE_ID
+        
+        jobs = []
+        for job in scheduler.get_jobs():
+            jobs.append({
+                "id": job.id,
+                "nextRun": job.next_run_time.isoformat() if job.next_run_time else None,
+                "func": job.func.__name__ if job.func else None
+            })
+        
+        return {
+            "instanceId": INSTANCE_ID,
+            "isActiveInstance": is_active_instance,
+            "currentLock": current_lock,
+            "scheduledJobs": jobs,
+            "jobCount": len(jobs)
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 # -------------------
 # Run server
