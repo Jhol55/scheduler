@@ -86,48 +86,63 @@ def verify_token(authorization: str = Header(None)):
 # -------------------
 def fire_webhook(message_id: str, retry_count: int = 0):
     redis_key = f"message:{message_id}"
-    message_json = redis_client.get(redis_key)
-    if not message_json:
-        print(f"[{datetime.now().isoformat()}] Message {message_id} not found in Redis. Skipping.")
-        try:
-            scheduler.remove_job(message_id)
-        except JobLookupError:
-            pass
+    execution_lock_key = f"executing:{message_id}"
+    
+    # Check if message is already being executed
+    if redis_client.exists(execution_lock_key):
+        print(f"[{datetime.now().isoformat()}] Message {message_id} is already being executed, skipping")
         return
-
-    message_data = json.loads(message_json)
-    webhook_url = message_data["webhookUrl"]
-    payload = message_data["payload"]
-    log_prefix = f"[{datetime.now().isoformat()}] [ID: {message_id}] [Try: {retry_count + 1}/{MAX_RETRIES}]"
-
+    
+    # Set execution lock with 5 minute TTL
+    redis_client.set(execution_lock_key, "1", ex=300)
+    
     try:
-        print(f"{log_prefix} Firing webhook to {webhook_url}")
-        response = requests.post(webhook_url, json=payload, timeout=30)
-        response.raise_for_status()
-        print(f"{log_prefix} Webhook fired successfully ({response.status_code})")
+        message_json = redis_client.get(redis_key)
+        if not message_json:
+            print(f"[{datetime.now().isoformat()}] Message {message_id} not found in Redis. Skipping.")
+            try:
+                scheduler.remove_job(message_id)
+            except JobLookupError:
+                pass
+            return
 
-        # Remove from Redis and scheduler after success
-        redis_client.delete(redis_key)
+        message_data = json.loads(message_json)
+        webhook_url = message_data["webhookUrl"]
+        payload = message_data["payload"]
+        log_prefix = f"[{datetime.now().isoformat()}] [ID: {message_id}] [Try: {retry_count + 1}/{MAX_RETRIES}]"
+
         try:
-            scheduler.remove_job(message_id)
-        except JobLookupError:
-            pass
+            print(f"{log_prefix} Firing webhook to {webhook_url}")
+            response = requests.post(webhook_url, json=payload, timeout=30)
+            response.raise_for_status()
+            print(f"{log_prefix} Webhook fired successfully ({response.status_code})")
 
-    except requests.RequestException as e:
-        print(f"{log_prefix} Failed to fire webhook: {e}")
-        if retry_count + 1 < MAX_RETRIES:
-            retry_time = datetime.utcnow() + timedelta(minutes=5)
-            scheduler.add_job(
-                fire_webhook,
-                "date",
-                run_date=retry_time,
-                args=[message_id, retry_count + 1],
-                id=message_id,
-                replace_existing=True
-            )
-            print(f"{log_prefix} Rescheduled retry at {retry_time.isoformat()}")
-        else:
-            print(f"{log_prefix} Max retries reached. Message remains in Redis for manual handling.")
+            # Remove from Redis and scheduler after success
+            redis_client.delete(redis_key)
+            try:
+                scheduler.remove_job(message_id)
+            except JobLookupError:
+                pass
+
+        except requests.RequestException as e:
+            print(f"{log_prefix} Failed to fire webhook: {e}")
+            if retry_count + 1 < MAX_RETRIES:
+                retry_time = datetime.utcnow() + timedelta(minutes=5)
+                scheduler.add_job(
+                    fire_webhook,
+                    "date",
+                    run_date=retry_time,
+                    args=[message_id, retry_count + 1],
+                    id=message_id,
+                    replace_existing=True
+                )
+                print(f"{log_prefix} Rescheduled retry at {retry_time.isoformat()}")
+            else:
+                print(f"{log_prefix} Max retries reached. Message remains in Redis for manual handling.")
+    
+    finally:
+        # Always remove execution lock
+        redis_client.delete(execution_lock_key)
 
 # -------------------
 # Helper to schedule a message
@@ -148,9 +163,17 @@ def schedule_message(message_data: Dict[str, Any]):
 
     if schedule_time <= now:
         print(f"[{datetime.now().isoformat()}] Message {message_id} is due now, executing immediately")
-        threading.Thread(target=fire_webhook, args=(message_id, 0), daemon=True).start()
+        # Execute immediately and don't schedule in the scheduler
+        # Use a small delay to ensure the message is properly processed
+        def delayed_execution():
+            import time
+            time.sleep(0.1)  # Small delay to ensure proper processing
+            fire_webhook(message_id, 0)
+        
+        threading.Thread(target=delayed_execution, daemon=True).start()
         return
 
+    # Only schedule if the time is in the future
     scheduler.add_job(
         fire_webhook,
         "date",
@@ -426,6 +449,21 @@ async def clear_instance_lock(token: str = Depends(verify_token)):
         return {"status": "cleared", "message": "Instance lock has been cleared"}
     except Exception as e:
         print(f"[{datetime.now().isoformat()}] Error clearing instance lock: {e}")
+        return {"error": str(e)}
+
+@app.post("/clear-execution-locks")
+async def clear_execution_locks(token: str = Depends(verify_token)):
+    """Clear all execution locks (for debugging)"""
+    try:
+        execution_keys = redis_client.keys("executing:*")
+        if execution_keys:
+            redis_client.delete(*execution_keys)
+            print(f"[{datetime.now().isoformat()}] Cleared {len(execution_keys)} execution locks")
+            return {"status": "cleared", "count": len(execution_keys), "message": f"Cleared {len(execution_keys)} execution locks"}
+        else:
+            return {"status": "no_locks", "count": 0, "message": "No execution locks found"}
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Error clearing execution locks: {e}")
         return {"error": str(e)}
 
 # -------------------
