@@ -193,14 +193,22 @@ def refresh_instance_lock():
 # -------------------
 # Restore messages from Redis on startup
 # -------------------
-def restore_scheduled_messages():
-    # Only restore if we have the instance lock
-    if not acquire_instance_lock():
-        return
+def restore_scheduled_messages(force_restore=False):
+    """
+    Restore scheduled messages from Redis.
+    If force_restore=True, bypasses the instance lock system.
+    """
+    if not force_restore:
+        # Try to acquire instance lock, but don't fail if we can't
+        if not acquire_instance_lock():
+            print(f"[{datetime.now().isoformat()}] Instance lock not acquired, but continuing with restoration anyway")
+    else:
+        print(f"[{datetime.now().isoformat()}] Force restoration mode - bypassing instance lock")
     
     keys = redis_client.keys("message:*")
     restored_count = 0
     skipped_count = 0
+    error_count = 0
     
     print(f"[{datetime.now().isoformat()}] Starting restoration of {len(keys)} messages from Redis")
     
@@ -208,6 +216,9 @@ def restore_scheduled_messages():
         try:
             message_data = json.loads(redis_client.get(key))
             message_id = message_data['id']
+            schedule_time_str = message_data['scheduleTo']
+            
+            print(f"[{datetime.now().isoformat()}] Processing message {message_id} with schedule {schedule_time_str}")
             
             # Check if job already exists in scheduler
             try:
@@ -219,17 +230,24 @@ def restore_scheduled_messages():
             except JobLookupError:
                 pass  # Job doesn't exist, continue
             
+            # Parse schedule time for logging
+            schedule_time = datetime.fromisoformat(schedule_time_str.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            
+            print(f"[{datetime.now().isoformat()}] Message {message_id}: schedule_time={schedule_time.isoformat()}, now={now.isoformat()}")
+            
             schedule_message(message_data)
             restored_count += 1
             print(f"[{datetime.now().isoformat()}] Restored message {message_id}")
             
         except Exception as e:
             print(f"[{datetime.now().isoformat()}] Failed to restore message {key}: {e}")
+            error_count += 1
     
-    print(f"[{datetime.now().isoformat()}] Restoration complete: {restored_count} restored, {skipped_count} skipped")
+    print(f"[{datetime.now().isoformat()}] Restoration complete: {restored_count} restored, {skipped_count} skipped, {error_count} errors")
 
-# Start restoration
-restore_scheduled_messages()
+# Start restoration - always restore on startup
+restore_scheduled_messages(force_restore=True)
 
 # Start background task to refresh instance lock
 def refresh_lock_task():
@@ -334,6 +352,80 @@ async def instance_status(token: str = Depends(verify_token)):
             "jobCount": len(jobs)
         }
     except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/messages/{message_id}/status")
+async def get_message_status(message_id: str, token: str = Depends(verify_token)):
+    """Get detailed status of a specific message"""
+    try:
+        redis_key = f"message:{message_id}"
+        
+        # Check Redis
+        message_json = redis_client.get(redis_key)
+        if not message_json:
+            return {"status": "not_found", "location": "redis", "message": "Message not found in Redis"}
+        
+        message_data = json.loads(message_json)
+        
+        # Check scheduler
+        try:
+            job = scheduler.get_job(message_id)
+            if job:
+                return {
+                    "status": "scheduled",
+                    "location": "both",
+                    "redis_data": message_data,
+                    "scheduler_info": {
+                        "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+                        "func": job.func.__name__ if job.func else None
+                    }
+                }
+        except JobLookupError:
+            pass
+        
+        return {
+            "status": "redis_only",
+            "location": "redis",
+            "redis_data": message_data,
+            "message": "Message exists in Redis but not in scheduler"
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/restore-messages")
+async def force_restore_messages(token: str = Depends(verify_token)):
+    """Force restoration of messages from Redis (for debugging)"""
+    try:
+        print(f"[{datetime.now().isoformat()}] Manual restoration triggered by API call")
+        
+        # Use the restore function with force_restore=True
+        restore_scheduled_messages(force_restore=True)
+        
+        # Get final counts
+        keys = redis_client.keys("message:*")
+        jobs = scheduler.get_jobs()
+        
+        return {
+            "status": "completed",
+            "totalMessages": len(keys),
+            "scheduledJobs": len(jobs),
+            "message": "Restoration completed successfully"
+        }
+        
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Error in force restore: {e}")
+        return {"error": str(e)}
+
+@app.post("/clear-instance-lock")
+async def clear_instance_lock(token: str = Depends(verify_token)):
+    """Clear the instance lock (for debugging)"""
+    try:
+        redis_client.delete(INSTANCE_LOCK_KEY)
+        print(f"[{datetime.now().isoformat()}] Instance lock cleared")
+        return {"status": "cleared", "message": "Instance lock has been cleared"}
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Error clearing instance lock: {e}")
         return {"error": str(e)}
 
 # -------------------
